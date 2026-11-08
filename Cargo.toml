@@ -1,0 +1,30 @@
+[package]
+name = "hyper"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rune = { git = "https://github.com/anomalyco/rune", rev = "47cb857795c3b1dd5097c15d6161719ae738ddda", features = ["native-file-dialog"] }
+rune-kit = { path = "vendor/rune-kit", features = ["markdown"] }
+rune-mac = { git = "https://github.com/anomalyco/rune", rev = "47cb857795c3b1dd5097c15d6161719ae738ddda" }
+objc2 = "0.5.2"
+objc2-foundation = { version = "0.2.2", features = ["NSString", "NSGeometry", "NSError", "NSURL", "NSURLRequest"] }
+block2 = "0.5"
+serde_json = "1"
+aho-corasick = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+memchr = "2"
+toml = "0.8"
+zstd = "0.13"
+notify = "8"
+libc = "0.2.191"
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "84373f8d48b8f0b794e259f74a71a52686616f5d", features = ["png"] }
+
+[profile.release]
+debug = false
+
+[lints.clippy]
+collapsible_if = "warn"
+uninlined_format_args = "warn"
+redundant_closure_for_method_calls = "warn"

@@ -1,0 +1,3 @@
+# The terminal engine is slow unoptimised, whatever the Rust profile.
+[env]
+LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseFast"

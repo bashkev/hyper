@@ -1,0 +1,32 @@
+{
+  "fill" : {
+    "solid" : "extended-srgb:0.06667,0.06667,0.07843,1.00000"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "pane-idle.svg",
+          "name" : "pane-idle"
+        },
+        {
+          "image-name" : "pane-active.svg",
+          "name" : "pane-active"
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : [
+      "macOS"
+    ]
+  }
+}
