@@ -46,6 +46,8 @@ mod window;
 mod workspace;
 mod worktree;
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 mod tests;
 
 use std::collections::HashSet;

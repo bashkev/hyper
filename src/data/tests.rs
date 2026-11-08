@@ -193,6 +193,17 @@ fn search_finds_text_that_json_stores_escaped() {
     assert_eq!((quoted.len(), slashed.len()), (1, 1));
 }
 
+/// Search scans for the query's first bytes, and a near miss there can overlap a real match.
+#[test]
+fn search_finds_a_match_that_overlaps_a_near_miss() {
+    let session = file_session("overlap", &reply_line("aaaaab, AAAAAAB and aaaab"));
+    let sessions = [session];
+    let hits = search(&sessions, "aaaab", &Arc::new(AtomicU64::new(0)), 0);
+    std::fs::remove_file(&sessions[0].path).unwrap();
+    let whole = Hit { session: "s".into(), count: 3, snippet: "aaaaab, AAAAAAB and aaaab".into(), uuid: "a".into() };
+    assert_eq!(hits, [whole]);
+}
+
 #[test]
 fn missing_history_and_empty_history_both_load_as_an_empty_index() {
     let none = PathBuf::from("/nonexistent");

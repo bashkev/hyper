@@ -20,6 +20,8 @@ mod reap;
 mod screen;
 mod selection;
 mod view;
+#[cfg(test)]
+mod bench;
 
 pub use pty::{login_shell, shell_command};
 pub use view::{cell, screen, style};
