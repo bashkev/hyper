@@ -7,6 +7,21 @@ use rune_kit::Kit;
 
 use super::{Frame, INSET, Line, Picture, Shape};
 
+/// What marks cells: the pointer's selection, matches of what's being found, and the match
+/// selected.
+#[derive(Clone, Copy)]
+pub struct Marks {
+    pub selection: Color,
+    pub found: Color,
+    pub current: Color,
+}
+
+impl Marks {
+    pub fn new(k: &Kit) -> Marks {
+        Marks { selection: k.selection(), found: k.alpha(k.c.text_accent, 0.22), current: k.alpha(k.c.text_accent, 0.6) }
+    }
+}
+
 /// The style every cell is set in.
 pub fn style(k: &Kit) -> TextStyle {
     k.ty.mono
@@ -17,7 +32,7 @@ pub fn cell(style: TextStyle) -> (f32, f32) {
     (rune::text::advance("M", style), style.line_height)
 }
 
-fn line_view(line: &Line, style: TextStyle, (cell_w, cell_h): (f32, f32), selection_color: Color) -> El {
+fn line_view(line: &Line, style: TextStyle, (cell_w, cell_h): (f32, f32), marks: Marks) -> El {
     let fills = line.fills.iter().map(|f| {
         col().absolute(f32::from(f.col) * cell_w, 0.0).size(f32::from(f.width) * cell_w, cell_h).fill(f.color.color())
     });
@@ -30,21 +45,26 @@ fn line_view(line: &Line, style: TextStyle, (cell_w, cell_h): (f32, f32), select
         }
         run
     });
-    let selection = line.selected.map(|(start, end)| col().key("terminal-selection").absolute(f32::from(start) * cell_w, 0.0).size(f32::from(end - start + 1) * cell_w, cell_h).fill(selection_color));
-    col().w_full().h(cell_h).children(fills).children(selection).children(runs)
+    let span = |(start, end): (u16, u16), color: Color| col().absolute(f32::from(start) * cell_w, 0.0).size(f32::from(end.saturating_sub(start) + 1) * cell_w, cell_h).fill(color);
+    let found = line.found.iter().map(|&cols| span(cols, marks.found));
+    let current = line.current.map(|cols| span(cols, marks.current).key("terminal-match"));
+    let selection = line.selected.map(|cols| span(cols, marks.selection).key("terminal-selection"));
+    col().w_full().h(cell_h).children(fills).children(found).children(current).children(selection).children(runs)
 }
 
 /// The screen, without the handlers that belong to the app.
-pub fn screen(frame: Option<&Frame>, style: TextStyle, cell: (f32, f32), focused: bool, selection_color: Color) -> El {
+pub fn screen(frame: Option<&Frame>, style: TextStyle, cell: (f32, f32), focused: bool, marks: Marks) -> El {
     let Some(frame) = frame else { return col() };
     let (cell_w, cell_h) = cell;
     let lines = frame.lines.iter().enumerate().map(|(i, line)| {
         let mut version = DefaultHasher::new();
         line.hash(&mut version);
         (cell_w.to_bits(), cell_h.to_bits()).hash(&mut version);
-        for c in [selection_color.r, selection_color.g, selection_color.b, selection_color.a] { c.to_bits().hash(&mut version); }
+        for c in [marks.selection, marks.found, marks.current] {
+            for v in [c.r, c.g, c.b, c.a] { v.to_bits().hash(&mut version); }
+        }
         let id = format!("terminal-line-{i}");
-        col().absolute(0.0, i as f32 * cell_h).w_full().h(cell_h).child(memo(id, version.finish(), || line_view(line, style, cell, selection_color)))
+        col().absolute(0.0, i as f32 * cell_h).w_full().h(cell_h).child(memo(id, version.finish(), || line_view(line, style, cell, marks)))
     });
     let caret = frame.caret.map(|c| {
         let (x, y) = (f32::from(c.col) * cell_w, f32::from(c.row) * cell_h);

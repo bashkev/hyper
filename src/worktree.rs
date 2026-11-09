@@ -239,7 +239,8 @@ pub fn busy(tree: &Path) -> bool {
     pids.iter().take(count.max(0) as usize).filter(|&&pid| pid > 0 && pid != me).any(|&pid| cwd_of(pid).is_some_and(|cwd| cwd.starts_with(&tree)))
 }
 
-fn cwd_of(pid: libc::pid_t) -> Option<PathBuf> {
+/// The folder process `pid` is working in now.
+pub fn cwd_of(pid: libc::pid_t) -> Option<PathBuf> {
     // SAFETY: a zeroed proc_vnodepathinfo is valid, and it's only written to.
     let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;

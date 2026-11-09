@@ -11,8 +11,10 @@
 //! - [`screen`]: reading the engine's screen into a [`Frame`].
 //! - [`keys`]: keys, paging and the wheel, encoded as the program wants them.
 //! - [`selection`]: selecting with the pointer, and copying it.
+//! - [`find`]: finding text, scrollback included.
 //! - [`view`]: drawing a frame.
 
+mod find;
 mod keys;
 mod links;
 mod pty;
@@ -23,9 +25,11 @@ mod view;
 #[cfg(test)]
 mod bench;
 
+pub use find::{Found, Toward};
 pub use pty::{login_shell, shell_command};
-pub use view::{cell, screen, style};
+pub use view::{Marks, cell, screen, style};
 
+use find::Finding;
 use keys::{Keys, engine_mods, key_input};
 use pty::{pipe, set_flags, spawn, winsize};
 use screen::{IMAGE_DECODED, IMAGE_WAKE, Screen};
@@ -38,7 +42,7 @@ use std::io::Write as _;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, Once, PoisonError};
 use std::time::Duration;
@@ -113,6 +117,10 @@ pub struct Line {
     pub fills: Vec<Fill>,
     pub runs: Vec<Run>,
     pub selected: Option<(u16, u16)>,
+    /// Matches of what's being found, first and last column.
+    pub found: Vec<(u16, u16)>,
+    /// The part of the selected match on this line.
+    pub current: Option<(u16, u16)>,
     pub links: Vec<Link>,
     /// The terminal wrapped this line onto the next one.
     pub wrapped: bool,
@@ -157,6 +165,8 @@ pub struct Frame {
     pub caret: Option<Caret>,
     pub fg: Rgb,
     pub bg: Rgb,
+    /// How finding is going, while something is being found.
+    pub found: Option<Found>,
 }
 
 /// What the program asked of the app.
@@ -210,6 +220,9 @@ enum Input {
     Focus(bool),
     Select(SelectionInput),
     Copy,
+    /// What to find. Empty stops finding.
+    Find(String),
+    FindNext(Toward),
     Stop,
     /// Save the screen to this file and give up the PTY without stopping the program.
     Handoff(PathBuf, Sender<Handed>),
@@ -347,6 +360,8 @@ struct Shared {
     events: Mutex<Vec<Event>>,
     /// The UI has taken the last frame.
     wanted: AtomicBool,
+    /// The program's pid once it's running, else 0.
+    pid: AtomicI32,
 }
 
 struct Launch {
@@ -478,6 +493,11 @@ impl Term {
         changed
     }
 
+    /// The program's pid, once it has started. It stays after the program ends.
+    pub fn pid(&self) -> Option<libc::pid_t> {
+        Some(self.shared.pid.load(Ordering::Acquire)).filter(|&pid| pid > 0)
+    }
+
     /// Says the program ended, as when the build before this one saw it end but its UI didn't.
     pub fn exited(&self, code: Option<i32>) {
         self.shared.events.lock().unwrap().push(Event::Exited(code));
@@ -540,6 +560,15 @@ impl Term {
 
     pub fn copy(&self) {
         self.send(Input::Copy);
+    }
+
+    /// Marks where `needle` is, and goes to the newest match. Empty stops finding.
+    pub fn find(&self, needle: &str) {
+        self.send(Input::Find(needle.to_owned()));
+    }
+
+    pub fn find_next(&self, toward: Toward) {
+        self.send(Input::FindNext(toward));
     }
 
     pub fn wheel(&mut self, ev: WheelEvent, cell: (f32, f32)) {
@@ -666,6 +695,7 @@ fn run(launch: &Launch, size: Size, inputs: Receiver<Input>, poked: OwnedFd, rea
     // The program ending says it's over, not the PTY closing: a background job it left behind
     // can hold the PTY open for as long as it likes.
     if let Some(pid) = group {
+        shared.pid.store(pid, Ordering::Release);
         reap::watch(pid, reaper);
     }
     let (fd, poked) = (master.as_ref().map_or(-1, AsRawFd::as_raw_fd), poked.as_raw_fd());
@@ -676,6 +706,7 @@ fn run(launch: &Launch, size: Size, inputs: Receiver<Input>, poked: OwnedFd, rea
     }
     let mut keys = Keys::new()?;
     let mut selection = Selecting::new()?;
+    let mut finding = Finding::default();
     let mut size = size;
     let mut dirty = true;
     let mut closed = group.is_none();
@@ -796,6 +827,14 @@ fn run(launch: &Launch, size: Size, inputs: Receiver<Input>, poked: OwnedFd, rea
                             wake();
                         }
                     }
+                    Input::Find(needle) => {
+                        let _ = finding.set(&mut term, &needle);
+                        dirty = true;
+                    }
+                    Input::FindNext(toward) => {
+                        let _ = finding.step(&mut term, toward);
+                        dirty = true;
+                    }
                 }
             }
         }
@@ -830,8 +869,11 @@ fn run(launch: &Launch, size: Size, inputs: Receiver<Input>, poked: OwnedFd, rea
             wake();
         }
         if dirty && !held.get() && shared.wanted.swap(false, Ordering::AcqRel) {
-            dirty = false;
-            if let Some(frame) = screen.frame(&term) {
+            // Before reading the screen, as going to a match can scroll it. What's left is searched
+            // for the next frame, which the UI asks for once it has taken this one.
+            dirty = finding.advance(&mut term).unwrap_or(false);
+            if let Some(mut frame) = screen.frame(&term) {
+                let _ = finding.mark(&mut term, &mut frame);
                 *shared.frame.lock().unwrap() = Some(frame);
                 wake();
             }

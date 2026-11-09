@@ -494,6 +494,34 @@ fn clicking_a_session_opens_it() {
 }
 
 #[test]
+fn a_copy_button_says_copied_and_then_goes_back() {
+    let root = fixture("copy");
+    let mut rt = runtime(root.clone());
+    until(&mut rt, "first transcript", loaded);
+    let clipboard = rune::clipboard::memory();
+    rt.use_clipboard(&clipboard);
+    if !rt.state.inspector.is_open() {
+        click(&mut rt, "inspector-toggle");
+    }
+    for _ in 0..30 { rt.frame(1.0 / 60.0); }
+    let label = |rt: &Runtime<App>| rt.elements().into_iter().find(|e| e.key.as_deref() == Some("copy-resume")).and_then(|e| e.label);
+    assert_eq!(label(&rt).as_deref(), Some("Copy resume command"));
+    click(&mut rt, "copy-resume");
+    let command = rt.state.selected_session().unwrap().resume_command();
+    until(&mut rt, "copied text", |_| clipboard.text().is_some());
+    assert_eq!(clipboard.text().as_deref().map(String::as_str), Some(command.as_str()));
+    assert_eq!(label(&rt).as_deref(), Some("Copied"));
+    assert!(rt.find("copy-resume/icon").is_some(), "with a check");
+    let copied = rt.state.reader.selected.clone().unwrap();
+    let other = if copied == "bbb" { "aaa" } else { "bbb" };
+    click(&mut rt, other);
+    until(&mut rt, "the other session", |rt| rt.state.reader.selected.as_deref() == Some(other) && loaded(rt));
+    assert_eq!(label(&rt).as_deref(), Some("Copy resume command"), "its command wasn't copied");
+    until(&mut rt, "the label to come back", |rt| label(rt).as_deref() == Some("Copy resume command"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn typing_finds_a_reply_and_opening_the_hit_scrolls_to_it() {
     let root = fixture("search");
     let mut rt = runtime(root.clone());
@@ -963,6 +991,37 @@ fn command_n_starts_the_current_tool_in_the_same_worktree_without_return() {
     });
     drop(rt);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn control_command_t_starts_a_shell_beside_an_agent_or_picks_it_in_the_launcher() {
+    let ctrl_cmd = Mods { cmd: true, ctrl: true, ..Default::default() };
+    let mut app = workspace_app(vec![]);
+    app.index_job.cancel();
+    app.ws.argv = Some(vec!["/bin/sleep".into(), "30".into()]);
+    let mut rt = Runtime::new(app, view, (1240.0, 800.0), Env::new(true, 2.0));
+    rt.on_key = Some(on_key);
+    rt.poll = Some(poll);
+    rt.frame(0.0);
+
+    key(&mut rt, Key::Command('t'), ctrl_cmd);
+    assert!(rt.state.ws.live.is_empty() && rt.find("launcher").is_some(), "no terminal to take a folder from");
+    assert_eq!(workspace::Tool::ALL[rt.state.ws.tool], workspace::Tool::Shell);
+
+    // It moves away from the folder it started in, as a shell's `cd` does.
+    let moves = vec!["/bin/sh".into(), "-c".into(), "cd /usr && exec sleep 30".into()];
+    rt.state.launch_for_test(workspace::Tool::Agent(Source::Codex), "/tmp", moves);
+    rt.state.set_pane(640.0, 340.0, (8.0, 17.0));
+    let usr = std::path::Path::new("/usr");
+    until(&mut rt, "the agent to move to /usr", |rt| {
+        rt.state.current().and_then(|l| l.term.pid()).and_then(crate::worktree::cwd_of).as_deref() == Some(usr)
+    });
+    key(&mut rt, Key::Command('t'), ctrl_cmd);
+    let tools: Vec<_> = rt.state.ws.live.iter().map(|l| (l.tool, l.project.as_str(), l.cwd())).collect();
+    let tmp = std::path::Path::new("/tmp");
+    assert_eq!(tools, [(workspace::Tool::Agent(Source::Codex), "alpha", tmp), (workspace::Tool::Shell, "alpha", usr)]);
+    assert_eq!(rt.state.current().map(|l| l.tool), Some(workspace::Tool::Shell));
+    assert!(!rt.state.ws.palette && rt.find("launcher").is_none());
 }
 
 #[test]
@@ -3089,4 +3148,50 @@ fn a_swipe_going_when_the_window_loses_focus_leaves_no_arrow() {
     settle(&mut rt);
     assert!(rt.find("swipe-arrow").is_none(), "the arrow went with the window's focus");
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_f_finds_in_the_terminal_without_typing_into_it_and_escape_gives_typing_back() {
+    let mut rt = run_in(workspace::Tool::Shell, "/", &["/bin/sh", "-c", "printf 'one needle\\r\\ntwo needle\\r\\n'; exec cat"]);
+    rt.on_key = Some(on_key);
+    until(&mut rt, "the output", |rt| printed(rt).contains("two needle"));
+    let found = |rt: &Runtime<App>| rt.state.current().and_then(|l| l.term.frame.as_ref()).and_then(|f| f.found);
+    let none = Mods::default();
+    key(&mut rt, Key::Command('f'), Mods { cmd: true, ..none });
+    assert!(rt.find("terminal-find").is_some(), "⌘F puts the find bar over the terminal");
+    key(&mut rt, Key::Text("needle".into()), none);
+    until(&mut rt, "the newest match", |rt| found(rt) == Some(term::Found { total: 2, selected: Some(0), complete: true }));
+    key(&mut rt, Key::Enter, none);
+    until(&mut rt, "the older match", |rt| found(rt) == Some(term::Found { total: 2, selected: Some(1), complete: true }));
+    assert_eq!(printed(&rt), "one needletwo needle", "what was typed into the bar didn't reach the program");
+    key(&mut rt, Key::Escape, none);
+    assert!(rt.find("terminal-find").is_none());
+    until(&mut rt, "the marks to go", |rt| found(rt).is_none());
+    key(&mut rt, Key::Text("x".into()), none);
+    until(&mut rt, "typing in the terminal", |rt| printed(rt).contains('x'));
+}
+
+#[test]
+fn the_find_bar_keeps_keys_and_focus_from_the_program_and_gives_way_to_the_launcher() {
+    // The terminal echoes what the program is sent: keys, and focus reports once it asks for them.
+    let mut rt = run_in(workspace::Tool::Shell, "/", &["/bin/sh", "-c", "printf 'ready\\033[?1004h\\r\\n'; exec cat"]);
+    rt.on_key = Some(on_key);
+    until(&mut rt, "the output", |rt| printed(rt).contains("ready"));
+    let none = Mods::default();
+    key(&mut rt, Key::Command('f'), Mods { cmd: true, ..none });
+    key(&mut rt, Key::Function(5), none);
+    key(&mut rt, Key::Escape, none);
+    until(&mut rt, "focus back", |rt| printed(rt).contains("^[[I"));
+    assert_eq!(printed(&rt), "ready^[[O^[[I", "the program lost focus to the bar, and F5 pressed in it never arrived");
+    key(&mut rt, Key::Command('f'), Mods { cmd: true, ..none });
+    key(&mut rt, Key::Command('n'), Mods { cmd: true, shift: true, ..none });
+    key(&mut rt, Key::Text("z".into()), none);
+    assert_eq!(rt.state.ws.query.text, "z", "the launcher has the keyboard");
+    key(&mut rt, Key::Escape, none);
+    key(&mut rt, Key::Text("y".into()), none);
+    assert_eq!(rt.state.ws.find.text, "y", "the bar has the keyboard back as the launcher goes");
+    key(&mut rt, Key::Escape, none);
+    key(&mut rt, Key::Text("x".into()), none);
+    until(&mut rt, "typing in the terminal", |rt| printed(rt).ends_with('x'));
+    assert_eq!(printed(&rt), "ready^[[O^[[I^[[O^[[Ix", "told only when the bar takes the keyboard and gives it back");
 }

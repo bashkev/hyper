@@ -4,6 +4,7 @@ use rune::{Anim, Cursor, El, Tx, col, el, icon, row, text};
 use rune_kit::shell::{self, RowStatus, SidebarRow};
 use rune_kit::{Button, ButtonVariant, Dialog, Kit};
 
+use super::find::find_bar;
 use super::launcher::{palette, palette_overlay};
 use super::{Live, Main, Tool, folder_project};
 use crate::commands::Action;
@@ -173,7 +174,7 @@ fn terminal(live: &Live, k: &Kit) -> El {
         // when the font changes even if the pane's outer rectangle hasn't moved.
         .child(col().key(format!("terminal-grid-{}-{}", cell.0.to_bits(), cell.1.to_bits())).w_full().grow(1.0).min_h(0.0)
             .on_layout(move |s: &mut App, [_, _, w, h]| s.set_pane(w, h, cell))
-            .child(term::screen(live.term.frame.as_ref(), style, cell, live.running(), k.selection())));
+            .child(term::screen(live.term.frame.as_ref(), style, cell, live.running(), term::Marks::new(k))));
     let bar = live.failed.map(|code| failure_bar(code, live.id, k));
     col().w_full().h_full().children(bar).child(screen)
 }
@@ -182,7 +183,7 @@ pub fn pane(s: &App, k: &Kit) -> El {
     match s.ws.main {
         // A little above the middle, and fixed there.
         Main::Launcher => col().w_full().h_full().px(24.0).items_center().py(16.0).child(el().grow(1.0)).child(palette(s, k, true).shrink().min_h(0.0)).child(el().grow(1.6)),
-        Main::Terminal(_) => col().w_full().h_full().children(s.current().map(|live| terminal(live, k))).children(palette_overlay(s, k)),
+        Main::Terminal(_) => col().w_full().h_full().children(s.current().map(|live| terminal(live, k))).children(find_bar(s, k)).children(palette_overlay(s, k)),
     }
 }
 

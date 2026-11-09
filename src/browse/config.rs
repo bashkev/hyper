@@ -12,7 +12,7 @@ use rune_kit::{Button, ButtonVariant, Kit, Markdown};
 use crate::config::{self, ConfigItem, Owner};
 use crate::format::timestamp;
 use crate::sidebar::{COMPACT_ROW, Item, ROW};
-use crate::ui::{center_message, centered, field};
+use crate::ui::{center_message, centered, copy_button, field};
 use crate::{App, View};
 
 /// The config items, as last read.
@@ -155,11 +155,5 @@ pub fn config_details(s: &App, k: &Kit) -> El {
     if let Some(modified) = modified {
         body = body.child(field("Updated", timestamp(modified.as_secs() as i64)));
     }
-    body.child(
-        Button::new("Copy path")
-            .variant(ButtonVariant::Neutral)
-            .on_press_tx(move |_: &mut App, tx| tx.copy(path.display().to_string()))
-            .build(k)
-            .key("copy-path"),
-    )
+    body.child(copy_button(s, "Copy path", "copy-path", path.display().to_string(), k))
 }

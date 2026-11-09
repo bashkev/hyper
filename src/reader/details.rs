@@ -1,11 +1,11 @@
 //! The open session's details in the inspector: where it ran, its size, and what it used.
 
 use rune::{Align, El, ScrollSpec, col, el, row, text};
-use rune_kit::{Button, ButtonVariant, Kit};
+use rune_kit::Kit;
 
 use super::disclosure;
 use crate::format::{money, size, spent, timestamp, token_count};
-use crate::ui::field;
+use crate::ui::{copy_button, field};
 use crate::usage::Report;
 use crate::{App, Load};
 
@@ -94,11 +94,5 @@ pub fn details(s: &App, k: &Kit) -> El {
         body = usage_details(s, report, body, k);
     }
     let command = session.resume_command();
-    viewport.child(body.child(
-        Button::new("Copy resume command")
-            .variant(ButtonVariant::Neutral)
-            .on_press_tx(move |_: &mut App, tx| tx.copy(command.clone()))
-            .build(k)
-            .key("copy-resume"),
-    ))
+    viewport.child(body.child(copy_button(s, "Copy resume command", "copy-resume", command, k)))
 }

@@ -41,7 +41,7 @@ fn bench_term() {
     let style = view::style(&Kit::neutral(true));
     let started = Instant::now();
     for _ in 0..runs {
-        black_box(view::screen(Some(&frame), style, (8.0, 16.0), true, Color::WHITE));
+        black_box(view::screen(Some(&frame), style, (8.0, 16.0), true, view::Marks { selection: Color::WHITE, found: Color::WHITE, current: Color::WHITE }));
     }
     println!("view::screen {cols}x{rows}: {:.1} µs", started.elapsed().as_secs_f64() * 1e6 / f64::from(runs));
 }

@@ -6,11 +6,15 @@
 //!   nothing is running.
 //! - [`alerts`]: what the terminals say, and telling the person when one needs them.
 //! - [`tidy`]: a worktree whose last terminal closed is removed, or asked about.
+//! - [`keyboard`]: whether typing goes to the terminal on screen, and telling its program.
+//! - [`find`]: ⌘F in a terminal.
 //! - [`handoff`]: terminals passed from this build to the next on a reload.
 //! - [`view`]: the sidebar's rows, the terminal pane and the Workspace's dialogs.
 
 mod alerts;
+mod find;
 mod handoff;
+mod keyboard;
 mod launcher;
 mod tidy;
 mod view;
@@ -21,7 +25,7 @@ pub use view::{live_row, live_title, new_button, pane, plus, quit_dialog, resume
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rune::{KeyEvent, Latest, PopupMenu, TextEdit, Tx};
+use rune::{Latest, PopupMenu, TextEdit, Tx};
 
 use crate::data::{Session, Source};
 use crate::live::Activity;
@@ -214,6 +218,11 @@ pub struct Workspace {
     /// The launcher is up over the terminal on screen. With no terminal, it's the main pane.
     pub palette: bool,
     pub query: TextEdit,
+    /// What ⌘F looks for in a terminal, and the terminal its bar is over.
+    pub find: TextEdit,
+    finding: Option<u64>,
+    /// The terminal last told whether it has the keyboard, and what it was told.
+    told: Option<(u64, bool)>,
     /// The launcher row the keyboard is on.
     active: Option<Choice>,
     /// The launcher is asking what to call a new worktree.
@@ -231,7 +240,7 @@ impl Default for Workspace {
     fn default() -> Workspace {
         Workspace { live: Vec::new(), next: 1, main: Main::Launcher, last_terminal: None, pane: None, projects: Vec::new(), project: None, folders: Vec::new(), folder: None, error: None, tool: 0, worktree: false, worktree_name: TextEdit::new(""), making: Latest::default(), creating: false, closed_worktrees: HashSet::new(), tidy: std::sync::mpsc::channel(), tidying: HashSet::new(), removing: HashSet::new(), asking: Vec::new(),
             #[cfg(test)]
-            argv: None, palette: false, query: focused(""), active: None, naming: false, window_focused: true, confirming_quit: false, scroll_up: false, badged: 0 }
+            argv: None, palette: false, query: focused(""), find: TextEdit::new(""), finding: None, told: None, active: None, naming: false, window_focused: true, confirming_quit: false, scroll_up: false, badged: 0 }
     }
 }
 
@@ -294,26 +303,6 @@ impl App {
     fn live_working(&self, live: &Live) -> bool {
         let session = live.session.as_deref().and_then(|id| self.session(id));
         live.said.unwrap_or_else(|| session.and_then(|s| self.activity(s)) == Some(Activity::Working))
-    }
-
-    /// The terminal the keyboard belongs to.
-    pub fn typing_term(&self) -> Option<&Term> {
-        // The launcher over it has the keyboard, even while its field is disabled.
-        if self.view != View::Workspace || self.ws.confirming_quit || self.ws.palette {
-            return None;
-        }
-        self.current().filter(|l| l.running()).map(|l| &l.term)
-    }
-
-    pub fn terminal_key(&self, ev: &KeyEvent, tx: &mut Tx) -> bool {
-        if self.view != View::Workspace || self.ws.confirming_quit || self.ws.palette {
-            return false;
-        }
-        if ev.is_command('c') && let Some(live) = self.current() {
-            live.term.copy();
-            return true;
-        }
-        self.typing_term().is_some_and(|t| t.key(ev, tx))
     }
 
     /// Agents that quitting would stop. A shell has nothing that can't be started again.
@@ -380,13 +369,32 @@ impl App {
         listed
     }
 
-    /// Starts the current tool in its existing folder, including its worktree.
+    /// Starts the tool of the terminal on screen again, as [`App::start_here`] does. With no
+    /// terminal, the launcher opens with Settings' default tool.
     pub fn new_session_here(&mut self, tx: &mut Tx) {
+        match self.current().map(|live| live.tool) {
+            Some(tool) => self.start_here(tool, tx),
+            None if self.ws.creating => {}
+            None => self.new_session(None, Some(tx)),
+        }
+    }
+
+    /// Starts `tool` where the program on screen is working, which a shell's `cd` may have
+    /// moved from the folder it started in, keeping its project. With no terminal there's no
+    /// folder to go by, so the launcher opens with `tool` picked.
+    pub fn start_here(&mut self, tool: Tool, tx: &mut Tx) {
         if self.ws.creating {
             return;
         }
-        let Some((project, cwd, tool)) = self.current().map(|live| (live.project.clone(), live.cwd.clone(), live.tool)) else {
-            return self.new_session(None, Some(tx));
+        let here = self.current().map(|live| {
+            // An ended program's pid could belong to another process by now.
+            let now = live.term.pid().filter(|_| live.running()).and_then(worktree::cwd_of);
+            (live.project.clone(), now.unwrap_or_else(|| live.cwd.clone()))
+        });
+        let Some((project, cwd)) = here else {
+            self.new_session(None, Some(tx));
+            self.ws.tool = tool.index();
+            return;
         };
         self.set_view(View::Workspace);
         self.start_in(tool, project, cwd);
@@ -402,6 +410,8 @@ impl App {
         self.launcher_defaults();
         self.ws.error = None;
         self.ws.naming = false;
+        // Rune moves focus to a field only when no other field still asks for it.
+        self.ws.find.focused = false;
         self.ws.query = focused("");
         self.ws.worktree_name = TextEdit::new("");
         self.ws.active = None;
@@ -521,8 +531,8 @@ impl App {
     pub fn show(&mut self, main: Main) {
         self.browser_release_keyboard();
         if let Main::Terminal(id) = main { self.ws.last_terminal = Some(id); }
-        if let Some(previous) = self.current() {
-            previous.term.focus(false);
+        if self.ws.finding.is_some_and(|id| main != Main::Terminal(id)) {
+            self.end_terminal_find();
         }
         self.ws.main = main;
         if main == Main::Launcher {
@@ -549,15 +559,6 @@ impl App {
             live.term.take_frame();
         }
         self.relist();
-    }
-
-    /// Lets the terminal on screen know whether it has the keyboard. Programs use this to
-    /// decide whether to notify.
-    pub fn tell_focus(&self) {
-        if let Some(live) = self.current() {
-            // The launcher over it has the keyboard.
-            live.term.focus(self.ws.window_focused && self.view == View::Workspace && !self.ws.palette);
-        }
     }
 
     pub fn set_pane(&mut self, width: f32, height: f32, cell: (f32, f32)) {

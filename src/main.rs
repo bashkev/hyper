@@ -150,6 +150,7 @@ struct App {
     reader: Reader,
     browser: browser::Browser,
     history: history::History,
+    copied: Option<ui::Copied>,
 }
 
 fn init() -> App {
@@ -200,6 +201,7 @@ impl App {
             reader: Reader::default(),
             browser: browser::Browser::default(),
             history: history::History::default(),
+            copied: None,
         };
         app.configure_workspace();
         app.request_index();
@@ -274,6 +276,8 @@ fn poll(s: &mut App, _: f64, tx: &mut Tx) -> bool {
     changed |= s.attend();
     changed |= s.reveal(tx);
     changed |= s.take_hold(tx);
+    changed |= s.take_copied(tx);
+    s.tell_focus();
     changed
 }
 

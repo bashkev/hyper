@@ -32,7 +32,8 @@ impl App {
         if !self.ws.creating {
             self.ws.error = None;
         }
-        self.tell_focus();
+        // The terminal is told on the next poll, once Rune has given focus back to what had it
+        // before, which can be the find bar.
     }
 
     /// Escape: out of naming a worktree, then away from the launcher.

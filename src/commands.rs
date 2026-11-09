@@ -23,6 +23,7 @@ macro_rules! catalog {
 
 catalog! {
     NewSession, "new_session", "New Session", "File", "cmd+n";
+    NewShell, "new_shell", "New Shell", "File", "ctrl+cmd+t";
     CommandPalette, "command_palette", "Command Palette…", "File", "cmd+shift+n";
     ChooseFolder, "choose_folder", "Choose Folder…", "File", "cmd+o";
     CloseSession, "close_session", "Close Session", "File", "cmd+w";
@@ -256,6 +257,7 @@ impl App {
         if self.keys_are_taken() { return; }
         match action {
             Action::NewSession => self.new_session_here(tx),
+            Action::NewShell => self.start_here(workspace::Tool::Shell, tx),
             Action::CommandPalette => self.new_session(None, Some(tx)),
             Action::ChooseFolder => {
                 // From the launcher on screen, the tool already picked there is the one to start.
@@ -278,6 +280,7 @@ impl App {
             Action::Browse => { self.set_view(View::Browse); tx.blur(); }
             Action::Search if self.project_has_keyboard(tx) => self.project_find(),
             Action::Search if self.browser_has_keyboard() => self.browser_find(),
+            Action::Search if self.view == View::Workspace && !self.ws.palette && self.current().is_some() => self.terminal_find(),
             Action::Search => {
                 self.set_view(View::Browse);
                 if !self.sidebar.is_open() { self.sidebar.toggle(); }

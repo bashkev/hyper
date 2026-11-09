@@ -1,7 +1,9 @@
 //! Glyphs and small pieces of interface shared by the sidebar, the panes and the inspector.
 
+use std::time::{Duration, Instant};
+
 use rune::{El, Icon, Tx, col, el, row, text};
-use rune_kit::{IconButton, IconButtonVariant, Kit};
+use rune_kit::{Button, ButtonVariant, IconButton, IconButtonVariant, Kit, glyphs};
 
 use crate::App;
 
@@ -102,4 +104,48 @@ pub fn field(label: &str, value: String, k: &Kit) -> El {
         .gap(2.0)
         .child(text(label.to_owned()).font(k.ty.small).color(k.c.text_faint))
         .child(text(value).font(k.ty.ui).color(k.c.text_base).wrap_anywhere().selectable(true))
+}
+
+/// How long a copy button says it copied.
+const COPIED_FOR: Duration = Duration::from_millis(1500);
+
+/// The copy button that last copied, and when it stops saying so.
+pub struct Copied {
+    key: &'static str,
+    /// The same button shows another item's value once that item is selected, which wasn't
+    /// copied.
+    value: String,
+    due: Instant,
+}
+
+/// A button that puts `value` on the clipboard, then shows a check and "Copied" for a moment.
+pub fn copy_button(s: &App, label: &str, key: &'static str, value: String, k: &Kit) -> El {
+    let button = match &s.copied {
+        Some(copied) if copied.key == key && copied.value == value => Button::new("Copied").icon(&glyphs::CHECK),
+        _ => Button::new(label),
+    };
+    button
+        .variant(ButtonVariant::Neutral)
+        .rolling(format!("{key}-label"))
+        .on_press_tx(move |s: &mut App, tx| {
+            tx.copy(value.clone());
+            s.copied = Some(Copied { key, value: value.clone(), due: Instant::now() + COPIED_FOR });
+            tx.wake_after(COPIED_FOR);
+        })
+        .build(k)
+        .key(key)
+}
+
+impl App {
+    /// Puts a copy button's label back once it's said "Copied" long enough. Says whether it did.
+    pub fn take_copied(&mut self, tx: &mut Tx) -> bool {
+        let Some(Copied { due, .. }) = self.copied else { return false };
+        let now = Instant::now();
+        if now < due {
+            tx.wake_after(due - now);
+            return false;
+        }
+        self.copied = None;
+        true
+    }
 }

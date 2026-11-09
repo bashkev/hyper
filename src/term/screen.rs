@@ -91,7 +91,7 @@ impl<'a> Screen<'a> {
                 _ => Shape::Block,
             },
         });
-        Some(Frame { lines, cols, pictures, caret, fg, bg })
+        Some(Frame { lines, cols, pictures, caret, fg, bg, found: None })
     }
 }
 

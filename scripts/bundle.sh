@@ -57,8 +57,14 @@ PLIST
 # identity across builds, but for an ad-hoc signature only until the next build.
 # HYPER_SIGN_IDENTITY picks one; otherwise the first Apple Development identity, if any.
 identity=${HYPER_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Apple Development/ { print $2; exit }')}
+# The default requirement names the certificate, which Xcode replaces when it renews one.
+# Requiring only the identity's team, its certificate's OU, keeps permissions across certificates.
+team=$(security find-certificate -a -Z -p 2>/dev/null | awk -v hash="$identity" '/^SHA-1 hash:/ { found = ($3 == hash) } found && !/^SHA-1/' \
+  | openssl x509 -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/^ *organizationalUnitName *= //p')
+set -- --sign "${identity:--}" --timestamp=none --force
+[ -n "$team" ] && set -- "$@" -r="designated => identifier \"$id\" and anchor apple generic and certificate leaf[subject.OU] = \"$team\""
 # Without --timestamp=none, an Apple identity signs over the network, and fails offline.
-if ! codesign --sign "${identity:--}" --timestamp=none --force "$app" > /dev/null 2>&1; then
+if ! codesign "$@" "$app" > /dev/null 2>&1; then
   echo "Couldn't sign with $identity; signed ad hoc, so macOS forgets permissions on each build." >&2
   codesign --sign - --force "$app" > /dev/null 2>&1
 fi

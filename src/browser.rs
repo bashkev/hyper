@@ -157,7 +157,7 @@ impl App {
     /// to a field only when no other field still asks for it, so the others let go.
     fn focus_browser_field(&mut self, field: fn(&mut Browser) -> &mut TextEdit) {
         let b = &mut self.browser;
-        for other in [&mut self.ws.query, &mut self.ws.worktree_name, &mut self.search.field, &mut b.address, &mut b.find] {
+        for other in [&mut self.ws.query, &mut self.ws.worktree_name, &mut self.ws.find, &mut self.search.field, &mut b.address, &mut b.find] {
             other.focused = false;
         }
         b.focus_page.set(false);

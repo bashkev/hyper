@@ -4,6 +4,7 @@
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 type CFTypeRef = *const c_void;
 
@@ -31,33 +32,53 @@ unsafe extern "C" {
 
 /// The permissions Hyper lacks, by their names in System Settings.
 pub fn missing() -> Vec<&'static str> {
+    // SAFETY: both only read this process's permission state.
     let (accessibility, screen) = unsafe { (AXIsProcessTrusted(), CGPreflightScreenCaptureAccess()) };
     [(!accessibility).then_some("Accessibility"), (!screen).then_some("Screen Recording")].into_iter().flatten().collect()
 }
 
-/// Shows macOS's requests for what's missing, once per app: `app` is the bundle, so Hyper and
-/// Hyper Dev each ask. Once refused, they're granted in System Settings.
+/// Shows macOS's requests for what's missing, once per signature: `app` is the bundle, so Hyper
+/// and Hyper Dev each ask. macOS ties a grant to the signature it was made for and ignores it
+/// once that changes, while System Settings still lists the app as allowed. So under a new
+/// signature, Hyper first resets its entries, then asks again.
 pub fn ask(home: &Path) {
     let Some(app) = bundle() else { return };
     let missing = missing();
+    if missing.is_empty() {
+        return;
+    }
+    // The bundle's identifier and designated requirement, which macOS checks a grant against.
+    let Ok(output) = Command::new("/usr/bin/codesign").arg("-dv").arg("-r-").arg(&app).output() else { return };
+    let details = String::from_utf8_lossy(&output.stderr);
+    let requirement = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let Some(identifier) = details.lines().find_map(|line| line.strip_prefix("Identifier=")) else { return };
     let marker = marker(home, &app);
-    if missing.is_empty() || marker.exists() {
+    if !output.status.success() || requirement.is_empty() || std::fs::read_to_string(&marker).is_ok_and(|asked| asked == requirement) {
         return;
     }
     if let Some(dir) = marker.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&marker, "");
-    unsafe {
-        if missing.contains(&"Accessibility") {
+    let _ = std::fs::write(&marker, &requirement);
+    let reset = |services: &[&str]| {
+        for service in services {
+            let _ = Command::new("/usr/bin/tccutil").args(["reset", service, identifier]).output();
+        }
+    };
+    if missing.contains(&"Accessibility") {
+        reset(&["Accessibility", "PostEvent"]);
+        // SAFETY: the options dictionary outlives the call that reads it and is released once.
+        unsafe {
             let (keys, values) = ([kAXTrustedCheckOptionPrompt], [kCFBooleanTrue]);
             let options = CFDictionaryCreate(std::ptr::null(), keys.as_ptr(), values.as_ptr(), 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
             AXIsProcessTrustedWithOptions(options);
             CFRelease(options);
         }
-        if missing.contains(&"Screen Recording") {
-            CGRequestScreenCaptureAccess();
-        }
+    }
+    if missing.contains(&"Screen Recording") {
+        reset(&["ScreenCapture"]);
+        // SAFETY: it takes no arguments and only asks macOS to show its prompt.
+        unsafe { CGRequestScreenCaptureAccess() };
     }
 }
 
