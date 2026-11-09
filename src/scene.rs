@@ -50,6 +50,11 @@ pub fn real(s: &mut App) {
         s.reader.selected = Some(session.id.clone());
         s.set_transcript(data::load_transcript(session));
     }
+    // `tabs=<url>,<url>` gives the browser those tabs, the last one shown.
+    if let Some(urls) = arg("tabs") {
+        let urls: Vec<&str> = urls.split(',').collect();
+        s.adopt_browser(&serde_json::json!({ "tabs": urls, "active": urls.len() - 1 }));
+    }
     // `panel=files|changes|browser` opens that pane beside what's shown.
     let panel = match arg("panel").as_deref() {
         Some("files") => Some(crate::project::Mode::Files),

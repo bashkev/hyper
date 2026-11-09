@@ -1,7 +1,7 @@
 //! One catalog for keyboard routing, native menus, and the Settings shortcut editor.
 
 use rune::{Key, KeyEvent, MenuItem, Shortcut, Tx};
-use crate::{App, View, settings::{self, Appearance, Settings}, term::Paging, workspace};
+use crate::{App, View, browser::CloseTab, history::Way, settings::{self, Appearance, Settings}, term::Paging, workspace};
 
 macro_rules! catalog {
     ($( $variant:ident, $id:literal, $title:literal, $menu:literal, $shortcut:literal; )*) => {
@@ -24,6 +24,7 @@ macro_rules! catalog {
 catalog! {
     NewSession, "new_session", "New Session", "File", "cmd+n";
     NewShell, "new_shell", "New Shell", "File", "ctrl+cmd+t";
+    NewTab, "new_tab", "New Tab", "File", "cmd+t";
     CommandPalette, "command_palette", "Command Palette…", "File", "cmd+shift+n";
     ChooseFolder, "choose_folder", "Choose Folder…", "File", "cmd+o";
     CloseSession, "close_session", "Close Session", "File", "cmd+w";
@@ -50,6 +51,7 @@ catalog! {
     ResetFont, "reset_font", "Actual Size", "View", "cmd+0";
     IncreaseInterface, "increase_interface", "Bigger Interface Text", "View", "cmd+alt+=";
     DecreaseInterface, "decrease_interface", "Smaller Interface Text", "View", "cmd+alt+-";
+    // In the web page while it has the keyboard, they go through its tabs, as in Safari.
     NextSession, "next_session", "Next Session", "Session", "cmd+shift+]";
     PreviousSession, "previous_session", "Previous Session", "Session", "cmd+shift+[";
     NextAttention, "next_attention", "Next Session Needing Attention", "Session", "cmd+shift+a";
@@ -112,7 +114,7 @@ impl Action {
         Some(shortcut)
     }
 
-    /// Which running session a numbered action shows, counted from 0 in sidebar order.
+    /// The position a numbered action shows, in the sidebar or browser tab strip.
     fn session_index(self, count: usize) -> Option<usize> {
         let at = match self {
             Action::Session1 => 0, Action::Session2 => 1, Action::Session3 => 2, Action::Session4 => 3,
@@ -158,6 +160,14 @@ pub fn menu(settings: &Settings) -> Vec<MenuItem<App>> {
 /// The shortcuts a web page keeps from the menu while it has the keyboard, as they're bound now.
 pub fn page_keys(settings: &Settings) -> Vec<Shortcut> {
     Action::ALL.iter().filter(|a| a.yields_to_page()).filter_map(|a| a.binding(settings)).collect()
+}
+
+pub(crate) fn browser_history_aliases(settings: &Settings) -> impl Iterator<Item = (Shortcut, Way)> + '_ {
+    [("cmd+left", Action::GoBack, Way::Back), ("cmd+right", Action::GoForward, Way::Forward)]
+        .into_iter().filter_map(|(alias, action, way)| {
+            let key = alias.parse().ok()?;
+            (!settings.shortcuts.contains_key(action.id()) && action_for(settings, &key).is_none()).then_some((key, way))
+        })
 }
 
 pub fn parse(value: &str) -> Result<Option<Shortcut>, String> {
@@ -245,7 +255,16 @@ impl App {
     pub fn command_key(&mut self, ev: &KeyEvent, tx: &mut Tx) -> bool {
         if self.keys_are_taken() { return false; }
         let Some(key) = event_shortcut(ev, tx) else { return false };
-        let Some(action) = action_for(&self.settings, &key) else { return false };
+        let action = action_for(&self.settings, &key).or_else(|| {
+            if !matches!(ev.key, Key::Left | Key::Right) || !self.browser_has_keyboard() {
+                return None;
+            }
+            browser_history_aliases(&self.settings).find(|(alias, _)| *alias == key).map(|(_, way)| match way {
+                Way::Back => Action::GoBack,
+                Way::Forward => Action::GoForward,
+            })
+        });
+        let Some(action) = action else { return false };
         let repeats = matches!(action, Action::IncreaseFont | Action::DecreaseFont | Action::IncreaseInterface | Action::DecreaseInterface | Action::PageUp | Action::PageDown);
         if !tx.key_repeat() || repeats {
             self.dispatch(action, tx);
@@ -258,6 +277,7 @@ impl App {
         match action {
             Action::NewSession => self.new_session_here(tx),
             Action::NewShell => self.start_here(workspace::Tool::Shell, tx),
+            Action::NewTab => self.new_browser_tab(tx),
             Action::CommandPalette => self.new_session(None, Some(tx)),
             Action::ChooseFolder => {
                 // From the launcher on screen, the tool already picked there is the one to start.
@@ -292,12 +312,14 @@ impl App {
             // ⌘W closes the launcher, not the terminal behind it.
             Action::CloseSession if self.ws.palette => self.close_palette(),
             Action::CloseSession if self.project_has_keyboard(tx) => self.project_close(),
-            Action::CloseSession if self.browser_has_keyboard() => self.browser_close(),
+            Action::CloseSession if self.browser_has_keyboard() => self.close_browser_tab(CloseTab::Active, tx),
             Action::CloseSession => match self.current().map(|l| l.id) {
                 Some(id) if self.view == View::Workspace => self.close_live(id),
                 // Nothing to close here, so ⌘W closes the window as it would without Hyper's menu.
                 _ => crate::request_quit(self, tx),
             },
+            Action::NextSession if self.browser_has_keyboard() => self.step_browser_tab(1, tx),
+            Action::PreviousSession if self.browser_has_keyboard() => self.step_browser_tab(-1, tx),
             Action::NextSession | Action::PreviousSession | Action::NextAttention => {
                 let ids: Vec<_> = self.live_in_order().into_iter().filter(|l| action != Action::NextAttention || l.needs_you).map(|l| l.id).collect();
                 if !ids.is_empty() {
@@ -311,11 +333,17 @@ impl App {
             }
             Action::Session1 | Action::Session2 | Action::Session3 | Action::Session4 | Action::Session5
             | Action::Session6 | Action::Session7 | Action::Session8 | Action::LastSession => {
-                let ids: Vec<_> = self.live_in_order().into_iter().map(|l| l.id).collect();
-                if let Some(at) = action.session_index(ids.len()) {
-                    self.set_view(View::Workspace);
-                    self.show(workspace::Main::Terminal(ids[at]));
-                    tx.blur();
+                if self.browser_has_keyboard() {
+                    if let Some(at) = action.session_index(self.browser.tab_count()) {
+                        self.select_browser_tab(at, tx);
+                    }
+                } else {
+                    let ids: Vec<_> = self.live_in_order().into_iter().map(|l| l.id).collect();
+                    if let Some(at) = action.session_index(ids.len()) {
+                        self.set_view(View::Workspace);
+                        self.show(workspace::Main::Terminal(ids[at]));
+                        tx.blur();
+                    }
                 }
             }
             Action::IncreaseFont | Action::DecreaseFont | Action::ResetFont | Action::IncreaseInterface | Action::DecreaseInterface => {
@@ -353,6 +381,7 @@ impl App {
             Action::GoForward if self.browser_has_keyboard() => self.browser_forward(),
             Action::GoBack => self.go(crate::history::Way::Back, 0, tx),
             Action::GoForward => self.go(crate::history::Way::Forward, 0, tx),
+            Action::ToggleTools if self.browser_has_keyboard() || (self.view == View::Workspace && !self.browser_open()) => self.reopen_browser_tab(tx),
             Action::ToggleTools => { if self.view == View::Browse { self.reader.toggle_tools(); } }
         }
     }

@@ -1,12 +1,13 @@
-//! The address bar, where Files and Changes have their tabs, and the page's place below it.
+//! The browser's tabs, address bar and the page's place below them.
 
-use rune::{El, Icon, Key, col, row, text};
+use rune::{Color, El, Icon, Key, col, row, text};
 use rune_kit::{Button, ButtonVariant, Kit, TextInput, glyphs};
 
+use super::CloseTab;
 use super::web::WebView;
 use crate::App;
 use crate::commands::Action;
-use crate::ui::{EXTERNAL, keys, pane_button};
+use crate::ui::{EXTERNAL, PLUS, keys, pane_button};
 
 pub static GLOBE: Icon = Icon {
     name: "browser-globe",
@@ -30,13 +31,13 @@ static RELOAD: Icon = Icon {
 };
 
 /// Back, forward, reload or stop, and the address.
-pub fn bar(s: &App, k: &Kit) -> El {
-    let b = &s.browser;
+fn bar(s: &App, k: &Kit) -> El {
+    let b = s.browser.tab();
     let field = TextInput::new(&b.address)
         .width(None)
         .placeholder("Address")
         .label("Address")
-        .on_edit(|s: &mut App| &mut s.browser.address)
+        .on_edit(|s: &mut App| &mut s.browser.tab_mut().address)
         .on_key(|s: &mut App, ev, tx| {
             let escape = ev.key == Key::Escape;
             if escape {
@@ -45,7 +46,7 @@ pub fn bar(s: &App, k: &Kit) -> El {
             escape
         })
         .on_submit(|s: &mut App, tx| {
-            let input = s.browser.address.text.clone();
+            let input = s.browser.tab().address.text.clone();
             tx.blur();
             s.browser_go(&input);
         })
@@ -66,7 +67,6 @@ pub fn bar(s: &App, k: &Kit) -> El {
         .h(32.0)
         .gap(2.0)
         .center_y()
-        .window_drag()
         .child(pane_button(&BACK, "Back", "", "browser-back", b.page.back, k, |s, _| s.browser_back()))
         .child(pane_button(&FORWARD, "Forward", "", "browser-forward", b.page.forward, k, |s, _| s.browser_forward()))
         .child(reload)
@@ -76,12 +76,13 @@ pub fn bar(s: &App, k: &Kit) -> El {
 /// What to find, red when the page hasn't got it, and the way to the next and previous match.
 fn find_bar(s: &App, k: &Kit) -> El {
     let b = &s.browser;
+    let found = b.tab().page.found;
     let field = TextInput::new(&b.find)
         .width(None)
         .placeholder("Find")
         .label("Find in page")
         .leading_icon(&glyphs::SEARCH)
-        .invalid(b.page.found == Some(false))
+        .invalid(found == Some(false))
         .on_edit(|s: &mut App| &mut s.browser.find)
         .on_change(|s: &mut App, _| s.browser_find_changed())
         .on_key(|s: &mut App, ev, tx| match ev.key {
@@ -111,34 +112,92 @@ fn find_bar(s: &App, k: &Kit) -> El {
         .child(pane_button(&glyphs::CLOSE, "Close find", keys(b.find.focused, "escape"), "browser-find-close", true, k, App::browser_close_find))
 }
 
-/// The page's title and controls, then the element the page goes over, or why it failed.
-pub fn pane(s: &App, k: &Kit) -> El {
+/// Each tab by its title, the one shown highlighted, then a button for another. Tabs narrow to
+/// share the strip, as Safari's do, and past their narrowest it scrolls.
+fn tabs(s: &App, k: &Kit) -> El {
+    const NARROWEST: f32 = 72.0;
+    const WIDEST: f32 = 200.0;
+    const GAP: f32 = 2.0;
     let b = &s.browser;
-    let url = b.url().to_owned();
-    let lead = if b.finding {
-        find_bar(s, k)
-    } else {
-        let title = if b.error.is_some() { String::new() } else { b.page.title.clone() };
-        text(title).font(k.ty.small).color(k.c.text_muted).grow(1.0).min_w(0.0).truncate()
-    };
-    let tools = row()
-        .w_full()
-        .h(36.0)
-        .px(10.0)
+    let new_tab = if s.browser_has_keyboard() { Action::NewTab.hint(&s.settings) } else { String::new() };
+    let count = b.tabs.len() as f32;
+    let width = if b.strip > 0.0 { ((b.strip - GAP * (count - 1.0)) / count).clamp(NARROWEST, WIDEST) } else { WIDEST };
+    let strip = row()
+        .gap(GAP)
+        .center_y()
+        .children(b.tabs.iter().enumerate().map(|(i, t)| {
+            let active = i == b.active;
+            let close = pane_button(&glyphs::CLOSE, "Close tab", "", &format!("browser-tab-close-{i}"), true, k, move |s, tx| s.close_browser_tab(CloseTab::At(i), tx));
+            row()
+                .key(format!("browser-tab-{i}"))
+                .w(width)
+                .h(28.0)
+                .pl(10.0)
+                .pr(2.0)
+                .gap(2.0)
+                .center_y()
+                .radius(6.0)
+                .fill(if active { k.c.hover } else { Color::TRANSPARENT })
+                .hover(k.c.hover)
+                .hover_group()
+                .focusable(false)
+                .preserve_focus_on_press(true)
+                .role("tab")
+                .label(t.name())
+                .help(t.url())
+                .focus_selected(active)
+                .child(text(t.name()).font(k.ty.small).color(if active { k.c.text_base } else { k.c.text_muted }).grow(1.0).min_w(0.0).truncate())
+                .child(if active { close } else { close.group_opacity(0.0, 1.0) })
+                .on_press_tx(move |s: &mut App, tx| s.select_browser_tab(i, tx))
+        }));
+    // Its width is the room it's given, whatever the tabs need, so they can share it.
+    let viewport = row()
+        .key("browser-tabs")
+        .role("tablist")
+        .label("Tabs")
+        .grow(1.0)
+        .min_w(0.0)
+        .center_y()
+        .scroll_x()
+        .on_layout_tx(App::browser_strip_laid_out)
+        .child(strip);
+    row()
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(GAP)
+        .center_y()
+        .child(viewport)
+        .child(pane_button(&PLUS, "New Tab", &new_tab, "browser-new-tab", true, k, App::new_browser_tab))
+}
+
+/// The tabs in the window's top row, beside the inspector buttons.
+pub fn tab_bar(s: &App, k: &Kit) -> El {
+    let url = s.browser.url().to_owned();
+    row()
+        .h(32.0)
         .gap(4.0)
         .center_y()
-        .child(lead)
+        .window_drag()
+        .child(tabs(s, k))
         .children((!url.is_empty()).then(|| {
             pane_button(&EXTERNAL, "Open in Default Browser", "", "browser-external", true, k, move |_, tx| {
                 let _ = tx.open_url(&url);
             })
         }))
-        .child(crate::project::expand_control(s, k));
+        .child(crate::project::expand_control(s, k))
+}
+
+/// The address and find controls, then the element the page goes over, or why it failed.
+pub fn pane(s: &App, k: &Kit) -> El {
+    let b = &s.browser;
     let mut page = col().key("browser-page").w_full().grow(1.0).min_h(0.0).on_layout(|s: &mut App, frame| s.browser_laid_out(frame));
-    if let Some(e) = &b.error {
+    if let Some(e) = &b.tab().error {
         page = page.center().gap(12.0).child(text(e.message.clone()).font(k.ty.ui).color(k.c.text_muted)).child(
             Button::new("Try Again").variant(ButtonVariant::Ghost).on_press(|s: &mut App| s.browser_reload()).build(k).key("browser-retry"),
         );
     }
-    col().key("browser-pane").w_full().h_full().min_h(0.0).fill(k.c.bg_base).child(tools).child(page)
+    col().key("browser-pane").w_full().h_full().min_h(0.0).fill(k.c.bg_base)
+        .child(bar(s, k).px(10.0))
+        .children(b.finding.then(|| find_bar(s, k).h(36.0).px(10.0)))
+        .child(page)
 }

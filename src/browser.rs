@@ -1,67 +1,72 @@
-//! Browser: a web page in the pane Files and Changes use, beside the terminal. Rune draws the
-//! address bar and leaves an empty element for the page ([`view`]), and a WKWebView ([`web`])
-//! goes over it.
+//! Browser: web pages in tabs ([`tabs`]), in the pane Files and Changes use, beside the
+//! terminal. Rune draws the address bar and the tabs and leaves an empty element for the page
+//! ([`view`]), and the shown tab's WKWebView ([`web`]) goes over it.
 //!
 //! Rune draws below the page, so the page hides while a dialog or toast is up.
 
 mod address;
+mod keys;
+mod tabs;
 mod view;
 mod web;
 
-pub use view::{BACK, FORWARD, GLOBE, bar, pane};
+pub use tabs::CloseTab;
+pub use view::{BACK, FORWARD, GLOBE, pane, tab_bar};
 pub use web::on_window;
+use keys::set_page_keys;
 
 use std::cell::Cell;
 
 use rune::{TextEdit, Tx};
-use serde_json::{Value, json};
-
 use crate::project::Mode;
 use crate::settings::Links;
 use crate::{App, View};
 
-#[derive(Default)]
 pub struct Browser {
-    pub address: TextEdit,
-    /// What ⌘F looks for in the page, while its bar is up.
+    /// Never empty: a browser with nowhere to go has one empty tab.
+    tabs: Vec<tabs::Tab>,
+    /// The tab shown.
+    active: usize,
+    /// Recently closed pages, with their former positions, newest last.
+    closed_tabs: Vec<(usize, String)>,
+    /// What ⌘F looks for in the shown page, while its bar is up.
     find: TextEdit,
     finding: bool,
-    /// Made when its element is first laid out.
-    web: Option<web::WebView>,
-    page: web::Page,
-    error: Option<web::Failure>,
-    /// Where to go once the page exists.
-    pending: Option<String>,
-    /// Whether the page is where Rune laid it out.
-    placed: bool,
+    /// Where Rune laid out the page's element, once it has.
+    frame: Option<[f32; 4]>,
+    /// How wide Rune laid out the tab strip, which the tabs share. 0 until it has.
+    strip: f32,
+    reveal_restored_tab: bool,
     /// Typing goes to the page once it's on screen, which may be a frame or two after the
     /// page is asked for. A hidden page would take the keyboard unseen.
     focus_page: Cell<bool>,
 }
 
+impl Default for Browser {
+    fn default() -> Browser {
+        Browser {
+            tabs: vec![tabs::Tab::default()],
+            active: 0,
+            closed_tabs: Vec::new(),
+            find: TextEdit::default(),
+            finding: false,
+            frame: None,
+            strip: 0.0,
+            reveal_restored_tab: false,
+            focus_page: Cell::new(false),
+        }
+    }
+}
+
 impl Browser {
-    /// Where the page is, or is about to go.
+    /// Where the shown page is, or is about to go.
     pub fn url(&self) -> &str {
-        self.pending
-            .as_deref()
-            .or_else(|| self.error.as_ref().and_then(|e| e.url.as_deref()))
-            .unwrap_or(&self.page.url)
+        self.tab().url()
     }
 
-    /// Goes to `url`, now or once the page exists.
-    fn load(&mut self, url: String) {
-        self.error = None;
-        match &self.web {
-            Some(web) => self.error = web.load(&url).err(),
-            None => self.pending = Some(url),
-        }
-    }
-
-    /// Does `f` to the page, once there is one.
+    /// Does `f` to the shown page, once there is one.
     fn with_page(&self, f: impl FnOnce(&web::WebView)) {
-        if let Some(web) = &self.web {
-            f(web);
-        }
+        self.tab().with_page(f);
     }
 }
 
@@ -80,11 +85,19 @@ impl App {
     /// come and go with Rune's elements.
     pub fn browser_sync(&self, covered: bool) {
         let b = &self.browser;
-        if b.web.is_some() {
-            web::set_page_keys(crate::commands::page_keys(&self.settings));
+        if b.tabs.iter().any(|t| t.web.is_some()) {
+            set_page_keys(&self.settings);
         }
-        let shown = self.browser_shown() && !covered && b.placed && b.error.is_none() && !b.url().is_empty();
-        b.with_page(|web| {
+        let shown = self.browser_shown() && !covered && b.frame.is_some();
+        // The others hide first, so the keyboard they let go of can go to the one shown.
+        for (i, tab) in b.tabs.iter().enumerate() {
+            if i != b.active {
+                tab.with_page(|web| web.set_shown(false));
+            }
+        }
+        let tab = b.tab();
+        let shown = shown && tab.error.is_none() && !tab.url().is_empty();
+        tab.with_page(|web| {
             web.set_shown(shown);
             if shown && b.focus_page.take() {
                 web.focus();
@@ -95,47 +108,54 @@ impl App {
     /// Whether typing goes to the address bar or the page.
     pub fn browser_has_keyboard(&self) -> bool {
         let b = &self.browser;
-        self.browser_shown() && (b.address.focused || b.find.focused || b.web.as_ref().is_some_and(web::WebView::has_keyboard))
+        let page = b.tab().web.as_ref().is_some_and(web::WebView::has_keyboard);
+        self.browser_shown() && (b.tab().address.focused || b.find.focused || page)
     }
 
     /// Typing goes back to Rune, as a session or another view takes the screen.
     pub fn browser_release_keyboard(&mut self) {
+        self.browser_release_fields();
         let b = &mut self.browser;
-        b.address.focused = false;
-        b.find.focused = false;
         b.focus_page.set(false);
-        b.with_page(web::WebView::release_keyboard);
+        for tab in &b.tabs {
+            tab.with_page(web::WebView::release_keyboard);
+        }
+    }
+
+    /// The address and find bars let go of the keyboard.
+    fn browser_release_fields(&mut self) {
+        let b = &mut self.browser;
+        for tab in &mut b.tabs {
+            tab.address.focused = false;
+        }
+        b.find.focused = false;
+    }
+
+    /// Typing goes to the shown page, once it's on screen.
+    fn browser_focus_page(&mut self, tx: &mut Tx) {
+        self.browser_release_fields();
+        tx.blur();
+        self.browser.focus_page.set(true);
     }
 
     /// ⇧⌘L and the pane's button: shows or hides the page. One opened with nowhere to show yet
     /// is ready for an address.
     pub fn toggle_browser(&mut self) {
         self.toggle_project_panel(Mode::Browser);
-        if self.browser_open() && self.browser.url().is_empty() {
+        if self.browser_open() && self.browser.tab().is_empty() {
             self.focus_address();
         }
     }
 
-    /// ⌘W from the page: it goes, as a browser's tab would, and so does the pane. The next one
-    /// starts empty.
-    pub fn browser_close(&mut self) {
-        // Before the page leaves the window, or the keyboard would leave with it.
-        self.browser_release_keyboard();
-        self.browser = Browser::default();
-        self.inspector.set_open(false);
-    }
-
-    /// Opens a link clicked elsewhere in Hyper, where Settings says. A web page goes to the
-    /// pane, and typing goes with it; anything else goes to macOS.
+    /// Opens a link clicked elsewhere in Hyper, where Settings says. A web page goes to a tab in
+    /// the pane, and typing goes with it; anything else goes to macOS.
     pub fn open_link(&mut self, url: &str, tx: &mut Tx) {
         let web = url.starts_with("http://") || url.starts_with("https://");
         if self.settings.links == Links::Browser || !web {
             let _ = tx.open_url(url);
             return;
         }
-        self.browser.address = TextEdit::new(url);
-        self.browser.load(url.to_owned());
-        self.browser.focus_page.set(true);
+        self.browser_open_tab(url, tx);
         if !self.browser_open() {
             self.toggle_project_panel(Mode::Browser);
         }
@@ -150,16 +170,17 @@ impl App {
     }
 
     fn focus_address(&mut self) {
-        self.focus_browser_field(|b| &mut b.address);
+        self.focus_browser_field(|b| &mut b.tab_mut().address);
     }
 
     /// One of the pane's fields takes the keyboard, with what's in it selected. Rune moves focus
     /// to a field only when no other field still asks for it, so the others let go.
     fn focus_browser_field(&mut self, field: fn(&mut Browser) -> &mut TextEdit) {
-        let b = &mut self.browser;
-        for other in [&mut self.ws.query, &mut self.ws.worktree_name, &mut self.ws.find, &mut self.search.field, &mut b.address, &mut b.find] {
+        for other in [&mut self.ws.query, &mut self.ws.worktree_name, &mut self.ws.find, &mut self.search.field] {
             other.focused = false;
         }
+        self.browser_release_fields();
+        let b = &mut self.browser;
         b.focus_page.set(false);
         b.with_page(web::WebView::release_keyboard);
         let edit = field(b);
@@ -200,10 +221,10 @@ impl App {
     /// Goes where `input` means, and typing goes to the page.
     pub fn browser_go(&mut self, input: &str) {
         let Some(url) = address::resolve(input) else { return };
-        let b = &mut self.browser;
-        b.address = TextEdit::new(&url);
-        b.load(url);
-        b.focus_page.set(true);
+        let tab = self.browser.tab_mut();
+        tab.address = TextEdit::new(&url);
+        tab.load(url);
+        self.browser.focus_page.set(true);
     }
 
     pub fn browser_back(&self) {
@@ -216,63 +237,24 @@ impl App {
 
     /// Reloads the page, or tries again where a load failed.
     pub fn browser_reload(&mut self) {
-        let b = &mut self.browser;
-        match b.error.take().and_then(|e| e.url) {
-            Some(url) => b.load(url),
-            None => b.with_page(web::WebView::reload),
+        let tab = self.browser.tab_mut();
+        match tab.error.take().and_then(|e| e.url) {
+            Some(url) => tab.load(url),
+            None => tab.with_page(web::WebView::reload),
         }
     }
 
     fn browser_laid_out(&mut self, frame: [f32; 4]) {
-        if self.browser.web.is_none() {
-            self.browser.web = web::WebView::new(self.wake());
-        }
-        let b = &mut self.browser;
-        let Some(web) = &b.web else { return };
-        web.place(frame);
-        b.placed = true;
-        if let Some(url) = b.pending.take() {
-            b.load(url);
-        }
-    }
-
-    /// Takes in what the page says changed. Says whether anything shown did.
-    pub fn take_browser(&mut self) -> bool {
-        let b = &mut self.browser;
-        let Some(web) = &b.web else { return false };
-        let (page, error) = (web.page(), web.error());
-        if page == b.page && error == b.error {
-            return false;
-        }
-        b.page = page;
-        b.error = error;
-        // What's being typed stays. A load that failed shows where it was going.
-        if !b.address.focused && b.address.text != b.url() {
-            b.address = TextEdit::new(b.url());
-        }
-        true
+        self.browser.frame = Some(frame);
+        self.browser_place(self.browser.active);
     }
 
     /// Escape in the address bar: what's typed goes, the address of the page comes back, and
     /// typing goes to the page.
     pub fn browser_address_escape(&mut self, tx: &mut Tx) {
-        let b = &mut self.browser;
-        b.address = TextEdit::new(b.url());
+        let tab = self.browser.tab_mut();
+        tab.address = TextEdit::new(tab.url());
         tx.blur();
-        b.focus_page.set(true);
-    }
-
-    pub fn browser_hand_off(&self) -> Value {
-        json!({ "url": self.browser.url(), "open": self.browser_open() })
-    }
-
-    pub fn adopt_browser(&mut self, state: &Value) {
-        if let Some(url) = state["url"].as_str().filter(|u| !u.is_empty()) {
-            self.browser.address = TextEdit::new(url);
-            self.browser.load(url.to_owned());
-        }
-        if state["open"].as_bool() == Some(true) {
-            self.toggle_project_panel(Mode::Browser);
-        }
+        self.browser.focus_page.set(true);
     }
 }

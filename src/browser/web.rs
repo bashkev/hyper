@@ -1,20 +1,21 @@
 //! The page: a WKWebView inside Rune's view, over the element Rune leaves for it. Rune can't
 //! draw a web page, so this native view sits on top of what Rune draws there.
 //!
-//! A delegate tells the app when the page's address, title, loading or history change, and when
-//! a load fails. The app reads the rest from the view.
+//! A delegate tells the app when the page's address, title, loading or history change, when a
+//! load fails, and when the page opens a tab or closes its own. The app reads the rest from the
+//! view.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
 use block2::{Block, RcBlock};
 use objc2::rc::Retained;
-use objc2::declare::ClassBuilder;
-use objc2::runtime::{AnyClass, AnyObject, Bool, NSObject, Sel};
-use objc2::{ClassType, DeclaredClass, class, declare_class, msg_send, msg_send_id, mutability, sel};
+use objc2::runtime::{AnyObject, Bool, NSObject};
+use objc2::{ClassType, DeclaredClass, class, declare_class, msg_send, msg_send_id, mutability};
 use objc2_foundation::{NSError, NSPoint, NSRect, NSSize, NSString, NSURL};
-use rune::{Shortcut, Waker, WindowHandle};
+use rune::{Waker, WindowHandle};
+
+use super::keys::page_class;
 
 #[link(name = "WebKit", kind = "framework")]
 unsafe extern "C" {}
@@ -25,10 +26,11 @@ const OBSERVED: [&str; 5] = ["URL", "title", "loading", "canGoBack", "canGoForwa
 const SCHEMES: [&str; 6] = ["http", "https", "about", "file", "data", "blob"];
 /// Some sites serve a reduced page to a browser they don't recognize.
 const USER_AGENT: &str = "Version/26.0 Safari/605.1.15";
+// WKNavigationTypeLinkActivated.
+const CLICKED: isize = 0;
 
 thread_local! {
     static WINDOW: RefCell<Option<WindowHandle>> = const { RefCell::new(None) };
-    static PAGE_KEYS: RefCell<Vec<Shortcut>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Keeps the window, for the view the page goes into.
@@ -61,6 +63,16 @@ pub struct Page {
     pub found: Option<bool>,
 }
 
+/// A tab the page opened.
+pub enum Opened {
+    /// A link meant for a new window, or `window.open`: shown, in a page WebKit made from this
+    /// one's configuration, so the new page's `window.opener` still reaches this one, as a
+    /// sign-in popup needs.
+    Shown(WebView),
+    /// A link ⌘-clicked or middle-clicked, to load behind this one.
+    Behind(WebView),
+}
+
 /// A load that failed: why, and where it was going.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Failure {
@@ -76,6 +88,10 @@ struct Ivars {
     /// of some failures, like a port out of range.
     asked: RefCell<Option<String>>,
     found: Cell<Option<bool>>,
+    /// Tabs the page opened, until the app takes them.
+    opened: RefCell<Vec<Opened>>,
+    /// Whether the page's script closed it.
+    closed: Cell<bool>,
 }
 
 declare_class!(
@@ -118,25 +134,43 @@ declare_class!(
         }
 
         #[method(webView:decidePolicyForNavigationAction:decisionHandler:)]
-        fn decide(&self, _web: *mut AnyObject, action: *mut AnyObject, decide: &Block<dyn Fn(isize)>) {
+        fn decide(&self, web: *mut AnyObject, action: *mut AnyObject, decide: &Block<dyn Fn(isize)>) {
             const CANCEL: isize = 0;
             const ALLOW: isize = 1;
-            // SAFETY: a WKNavigationAction's request and its URL, either of which may be nil.
-            let url: *mut AnyObject = unsafe {
+            // SAFETY: a WKNavigationAction's request, URL and target frame, which may be nil.
+            let (request, url, target, kind): (*mut AnyObject, *mut AnyObject, *mut AnyObject, isize) = unsafe {
                 let request: *mut AnyObject = msg_send![action, request];
-                msg_send![request, URL]
+                (request, msg_send![request, URL], msg_send![action, targetFrame], msg_send![action, navigationType])
             };
-            let scheme = if url.is_null() { None } else { unsafe { string(msg_send_id![url, scheme]) } };
-            if scheme.is_none_or(|s| SCHEMES.contains(&s.to_ascii_lowercase().as_str())) {
+            // SAFETY: a live NSURL.
+            let scheme = if url.is_null() { None } else { unsafe { string(msg_send_id![url, scheme]) }.map(|s| s.to_ascii_lowercase()) };
+            if scheme.as_deref().is_none_or(|s| SCHEMES.contains(&s)) {
+                // A nil target already goes through the new-window delegate with its request intact.
+                // A blob that still targets this frame needs to stay in its originating document.
+                if !target.is_null() && !url.is_null() && scheme.as_deref() != Some("blob")
+                    // SAFETY: the navigation action is live for the duration of this callback.
+                    && unsafe { opens_behind(action, kind) }
+                    && let Some(parent) = rune_view()
+                {
+                    // SAFETY: use the source view's configuration and the original NSURLRequest.
+                    let page = unsafe {
+                        let config: Retained<AnyObject> = msg_send_id![web, configuration];
+                        let page = WebView::with_configuration(&parent, &config, self.ivars().wake.clone());
+                        *page.delegate.ivars().asked.borrow_mut() = string(msg_send_id![url, absoluteString]);
+                        let _: *mut AnyObject = msg_send![&*page.view, loadRequest: request];
+                        page
+                    };
+                    self.ivars().opened.borrow_mut().push(Opened::Behind(page));
+                    (self.ivars().wake)();
+                    return decide.call((CANCEL,));
+                }
                 return decide.call((ALLOW,));
             }
             // Another app's link opens only when it's clicked, so a page's script can't launch an
-            // app on its own. WKNavigationTypeLinkActivated.
-            const CLICKED: isize = 0;
-            // SAFETY: a WKNavigationAction's type, and a live NSURL.
-            unsafe {
-                let kind: isize = msg_send![action, navigationType];
-                if kind == CLICKED {
+            // app on its own.
+            if kind == CLICKED {
+                // SAFETY: NSWorkspace with a live NSURL.
+                unsafe {
                     let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
                     let _: Bool = msg_send![workspace, openURL: url];
                 }
@@ -152,22 +186,54 @@ declare_class!(
             let _: *mut AnyObject = unsafe { msg_send![web, reload] };
         }
 
-        /// A link meant for a new window, or `window.open`: it opens here, as there are no tabs.
+        /// A link meant for a new window, or `window.open`: it opens in a tab. WebKit loads it
+        /// in the page returned, which has to be made from `config`.
         #[method(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:)]
-        fn new_window(&self, web: *mut AnyObject, _config: *mut AnyObject, action: *mut AnyObject, _features: *mut AnyObject) -> *mut AnyObject {
-            // SAFETY: the WKWebView and WKNavigationAction WebKit names.
-            unsafe {
-                let request: *mut AnyObject = msg_send![action, request];
-                let _: *mut AnyObject = msg_send![web, loadRequest: request];
-            }
-            std::ptr::null_mut()
+        fn new_window(&self, _web: *mut AnyObject, config: *mut AnyObject, action: *mut AnyObject, _features: *mut AnyObject) -> *mut AnyObject {
+            // SAFETY: a WKNavigationAction's navigation type, modifiers and button.
+            let behind = unsafe {
+                opens_behind(action, msg_send![action, navigationType])
+            };
+            // SAFETY: the WKWebViewConfiguration WebKit passes, which it keeps alive.
+            let Some(config) = (unsafe { Retained::retain(config) }) else { return std::ptr::null_mut() };
+            let Some(parent) = rune_view() else { return std::ptr::null_mut() };
+            let page = WebView::with_configuration(&parent, &config, self.ivars().wake.clone());
+            // The tab keeps the page, so WebKit gets it unretained, as it expects.
+            let view = Retained::as_ptr(&page.view).cast_mut();
+            self.ivars().opened.borrow_mut().push(if behind { Opened::Behind(page) } else { Opened::Shown(page) });
+            (self.ivars().wake)();
+            view
+        }
+
+        /// The page's script closed it, as a sign-in popup does when it's done.
+        #[method(webViewDidClose:)]
+        fn did_close(&self, _web: *mut AnyObject) {
+            self.ivars().closed.set(true);
+            (self.ivars().wake)();
         }
     }
 );
 
+/// Whether a link click asks for a background tab. `action` must be a live WKNavigationAction.
+unsafe fn opens_behind(action: *mut AnyObject, kind: isize) -> bool {
+    const COMMAND: usize = 1 << 20;
+    // WebKit numbers the middle button as NSEvent's button mask does.
+    const MIDDLE: isize = 1 << 2;
+    // SAFETY: the action is live and the properties return NSEvent flags and a button number.
+    let (flags, button): (usize, isize) = unsafe { (msg_send![action, modifierFlags], msg_send![action, buttonNumber]) };
+    kind == CLICKED && (flags & COMMAND != 0 || button == MIDDLE)
+}
+
 impl Delegate {
     fn new(wake: Waker) -> Retained<Delegate> {
-        let this = Delegate::alloc().set_ivars(Ivars { wake, error: RefCell::new(None), asked: RefCell::new(None), found: Cell::new(None) });
+        let this = Delegate::alloc().set_ivars(Ivars {
+            wake,
+            error: RefCell::new(None),
+            asked: RefCell::new(None),
+            found: Cell::new(None),
+            opened: RefCell::new(Vec::new()),
+            closed: Cell::new(false),
+        });
         // SAFETY: NSObject's init.
         unsafe { msg_send_id![super(this), init] }
     }
@@ -194,79 +260,6 @@ impl Delegate {
     }
 }
 
-/// WKWebView, with the app's menu first to see a shortcut, but for the page's own keys. WebKit
-/// keeps every key equivalent it's offered for the page, and doesn't hand back one the page
-/// leaves alone, so without the menu first ⌘W, ⌘1 or ⌘L would do nothing while the page has the
-/// keyboard. Copy, Paste and Undo still reach the page: their menu items act on whatever has the
-/// keyboard.
-fn page_class() -> &'static AnyClass {
-    static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
-    CLASS.get_or_init(|| {
-        extern "C" fn perform_key_equivalent(this: *mut AnyObject, _: Sel, event: *mut AnyObject) -> Bool {
-            // SAFETY: an NSEvent's keys, AppKit's main menu and WKWebView's own method, on the
-            // main thread.
-            unsafe {
-                let page_first = shortcut(event).is_some_and(|key| PAGE_KEYS.with_borrow(|keys| keys.contains(&key)));
-                if !page_first {
-                    let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-                    let menu: *mut AnyObject = msg_send![app, mainMenu];
-                    if !menu.is_null() && msg_send![menu, performKeyEquivalent: event] {
-                        return Bool::YES;
-                    }
-                }
-                msg_send![super(&*this, class!(WKWebView)), performKeyEquivalent: event]
-            }
-        }
-        // The mouse's side buttons go back and forward in the page, as in Safari.
-        extern "C" fn other_mouse_up(this: *mut AnyObject, _: Sel, event: *mut AnyObject) {
-            // SAFETY: an NSEvent for a mouse button, and WKWebView's own methods, on the main
-            // thread.
-            unsafe {
-                let button: isize = msg_send![event, buttonNumber];
-                match button {
-                    3 => { let _: *mut AnyObject = msg_send![this, goBack]; }
-                    4 => { let _: *mut AnyObject = msg_send![this, goForward]; }
-                    _ => { let _: () = msg_send![super(&*this, class!(WKWebView)), otherMouseUp: event]; }
-                }
-            }
-        }
-        let mut builder = ClassBuilder::new("HyperWebView", class!(WKWebView)).expect("HyperWebView is declared once");
-        // SAFETY: the signatures match -[NSView performKeyEquivalent:] and -[NSResponder otherMouseUp:].
-        unsafe {
-            builder.add_method(
-                sel!(performKeyEquivalent:),
-                perform_key_equivalent as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> Bool,
-            );
-            builder.add_method(sel!(otherMouseUp:), other_mouse_up as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject));
-        }
-        builder.register()
-    })
-}
-
-/// The shortcut a key event is, as Rune names it.
-///
-/// # Safety
-/// `event` is a live NSEvent for a key.
-unsafe fn shortcut(event: *mut AnyObject) -> Option<Shortcut> {
-    const SHIFT: usize = 1 << 17;
-    const CONTROL: usize = 1 << 18;
-    const OPTION: usize = 1 << 19;
-    const COMMAND: usize = 1 << 20;
-    let (key, flags): (Option<Retained<NSString>>, usize) = unsafe { (msg_send_id![event, charactersIgnoringModifiers], msg_send![event, modifierFlags]) };
-    let mut name: String = [(CONTROL, "ctrl+"), (OPTION, "alt+"), (SHIFT, "shift+"), (COMMAND, "cmd+")]
-        .into_iter()
-        .filter(|(bit, _)| flags & bit != 0)
-        .map(|(_, part)| part)
-        .collect();
-    name.push_str(&key?.to_string().to_lowercase());
-    name.parse().ok()
-}
-
-/// The shortcuts the page keeps while it has the keyboard, ahead of the app's menu.
-pub fn set_page_keys(keys: Vec<Shortcut>) {
-    PAGE_KEYS.with_borrow_mut(|current| *current = keys);
-}
-
 fn string(s: Option<Retained<NSString>>) -> Option<String> {
     s.map(|s| s.to_string())
 }
@@ -280,9 +273,8 @@ impl WebView {
     /// A hidden page in the window's view. None before the window exists, and headless.
     pub fn new(wake: Waker) -> Option<WebView> {
         let parent = rune_view()?;
-        let delegate = Delegate::new(wake);
         // SAFETY: WebKit's documented setup, on the main thread.
-        let view = unsafe {
+        let config = unsafe {
             let config: Retained<AnyObject> = msg_send_id![class!(WKWebViewConfiguration), new];
             let _: () = msg_send![&*config, setApplicationNameForUserAgent: &*NSString::from_str(USER_AGENT)];
             // As in Safari, a page plays sound only after a click: WKAudiovisualMediaTypeAudio.
@@ -291,8 +283,26 @@ impl WebView {
             let preferences: *mut AnyObject = msg_send![&*config, preferences];
             let yes: *mut AnyObject = msg_send![class!(NSNumber), numberWithBool: Bool::YES];
             let _: () = msg_send![preferences, setValue: yes, forKey: &*NSString::from_str("developerExtrasEnabled")];
+            // Keep blob navigation in WebKit so it can carry the source document's blob context.
+            let world: *mut AnyObject = msg_send![class!(WKContentWorld), defaultClientWorld];
+            let source = NSString::from_str(include_str!("blob_links.js"));
+            let script: Retained<AnyObject> = msg_send_id![msg_send_id![class!(WKUserScript), alloc],
+                initWithSource: &*source, injectionTime: 0isize, forMainFrameOnly: Bool::NO, inContentWorld: world];
+            let controller: *mut AnyObject = msg_send![&*config, userContentController];
+            let _: () = msg_send![controller, addUserScript: &*script];
+            config
+        };
+        Some(WebView::with_configuration(&parent, &config, wake))
+    }
+
+    /// A hidden page in `parent` made from `config`: [`WebView::new`]'s, or the one WebKit gives
+    /// a page another opened.
+    fn with_configuration(parent: &AnyObject, config: &AnyObject, wake: Waker) -> WebView {
+        let delegate = Delegate::new(wake);
+        // SAFETY: WebKit's documented setup, on the main thread.
+        let view = unsafe {
             let view: Retained<AnyObject> =
-                msg_send_id![msg_send_id![page_class(), alloc], initWithFrame: NSRect::ZERO, configuration: &*config];
+                msg_send_id![msg_send_id![page_class(), alloc], initWithFrame: NSRect::ZERO, configuration: config];
             let _: () = msg_send![&*view, setAllowsBackForwardNavigationGestures: Bool::YES];
             let _: () = msg_send![&*view, setAllowsMagnification: Bool::YES];
             let _: () = msg_send![&*view, setHidden: Bool::YES];
@@ -301,10 +311,10 @@ impl WebView {
             for key in OBSERVED {
                 let _: () = msg_send![&*view, addObserver: &*delegate, forKeyPath: &*NSString::from_str(key), options: 0usize, context: std::ptr::null_mut::<c_void>()];
             }
-            let _: () = msg_send![&*parent, addSubview: &*view];
+            let _: () = msg_send![parent, addSubview: &*view];
             view
         };
-        Some(WebView { view, delegate })
+        WebView { view, delegate }
     }
 
     /// Puts the page at `[x, y, w, h]` in Rune's points.
@@ -377,7 +387,8 @@ impl WebView {
         unsafe {
             let url: Option<Retained<NSURL>> = msg_send_id![&*self.view, URL];
             Page {
-                url: url.and_then(|u| string(msg_send_id![&*u, absoluteString])).unwrap_or_default(),
+                url: url.and_then(|u| string(msg_send_id![&*u, absoluteString]))
+                    .or_else(|| self.delegate.ivars().asked.borrow().clone()).unwrap_or_default(),
                 title: string(msg_send_id![&*self.view, title]).unwrap_or_default(),
                 loading: msg_send![&*self.view, isLoading],
                 back: msg_send![&*self.view, canGoBack],
@@ -416,6 +427,16 @@ impl WebView {
         self.delegate.ivars().found.set(None);
     }
 
+    /// The tabs the page opened since it was last asked.
+    pub fn take_opened(&self) -> Vec<Opened> {
+        self.delegate.ivars().opened.take()
+    }
+
+    /// Whether the page's script closed it.
+    pub fn closed(&self) -> bool {
+        self.delegate.ivars().closed.get()
+    }
+
     /// Why the last load failed, until another one commits.
     pub fn error(&self) -> Option<Failure> {
         self.delegate.ivars().error.borrow().clone()
@@ -435,17 +456,7 @@ impl WebView {
 
     /// Whether the page, or a field in it, has the keyboard.
     pub fn has_keyboard(&self) -> bool {
-        let window = self.window();
-        if window.is_null() {
-            return false;
-        }
-        // SAFETY: the window's first responder, which may be the window itself or nil.
-        unsafe {
-            let responder: *mut AnyObject = msg_send![window, firstResponder];
-            !responder.is_null()
-                && msg_send![responder, isKindOfClass: class!(NSView)]
-                && msg_send![responder, isDescendantOf: &*self.view]
-        }
+        super::keys::page_has_keyboard(&self.view)
     }
 
     /// Gives the keyboard back to Rune, which has it whenever the page doesn't.

@@ -116,7 +116,7 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
                 _ => project::pane(s, &k),
             })
             .children((s.project.mode != project::Mode::Details).then(|| {
-                let top = if s.project.mode == project::Mode::Browser { browser::bar(s, &k) } else { project::tabs(s, &k) };
+                let top = if s.project.mode == project::Mode::Browser { browser::tab_bar(s, &k) } else { project::tabs(s, &k) };
                 // Centred on the panel toggles: they're 24pt tall at 20pt from the window's top, and
                 // this 32pt row sits inside the window frame's inset.
                 top.pin(Some(project_tabs_left), Some(8.0 + project_top), Some(project_controls_width + 28.0), None)

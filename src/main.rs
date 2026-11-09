@@ -269,7 +269,7 @@ fn poll(s: &mut App, _: f64, tx: &mut Tx) -> bool {
     changed |= s.take_hits(tx);
     changed |= s.take_transcript();
     changed |= s.take_changes();
-    changed |= s.take_browser();
+    changed |= s.take_browser(tx);
     changed |= s.take_refreshed();
     changed |= s.take_tail();
     changed |= s.settle(tx);

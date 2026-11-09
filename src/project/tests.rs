@@ -1,6 +1,7 @@
 use super::*;
 use rune_kit::diff::DiffMode;
 use rune::{Env, Runtime};
+use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -619,7 +620,7 @@ fn the_browser_takes_the_keyboard_from_the_terminal_and_survives_a_reload() {
     click(&mut rt, "browser-toggle");
     rt.frame(1.0 / 60.0);
     assert_eq!(rt.state.project.mode, Mode::Browser);
-    assert!(rt.state.browser.address.focused, "An empty browser opens ready for an address");
+    assert!(rt.state.browser.tab().address.focused, "An empty browser opens ready for an address");
     assert!(rt.state.browser_has_keyboard());
     let mut files = true;
     rt.update(|s, tx| files = s.project_has_keyboard(tx));
@@ -628,7 +629,7 @@ fn the_browser_takes_the_keyboard_from_the_terminal_and_survives_a_reload() {
     rt.key(KeyEvent { key: Key::Text("typo".into()), mods: Default::default() });
     rt.key(KeyEvent { key: Key::Escape, mods: Default::default() });
     rt.frame(1.0 / 60.0);
-    assert!(rt.state.browser.address.text.is_empty() && !rt.state.browser.address.focused, "Escape drops what was typed");
+    assert!(rt.state.browser.tab().address.text.is_empty() && !rt.state.browser.tab().address.focused, "Escape drops what was typed");
     rt.key(cmd('l'));
     rt.key(KeyEvent { key: Key::Text("3000".into()), mods: Default::default() });
     rt.key(KeyEvent { key: Key::Enter, mods: Default::default() });
@@ -639,7 +640,7 @@ fn the_browser_takes_the_keyboard_from_the_terminal_and_survives_a_reload() {
     rt.key(cmd('f'));
     rt.frame(1.0 / 60.0);
     assert_eq!(rt.state.view, View::Workspace, "⌘F finds in the page, not in sessions");
-    assert!(rt.state.browser_has_keyboard() && !rt.state.browser.address.focused, "The find bar has the keyboard");
+    assert!(rt.state.browser_has_keyboard() && !rt.state.browser.tab().address.focused, "The find bar has the keyboard");
     assert!(rt.find("browser-find").is_some());
     rt.key(KeyEvent { key: Key::Escape, mods: Default::default() });
     rt.frame(1.0 / 60.0);
@@ -666,7 +667,7 @@ fn the_browser_takes_the_keyboard_from_the_terminal_and_survives_a_reload() {
 
     rt.key(cmd('l'));
     rt.frame(1.0 / 60.0);
-    assert!(rt.state.browser.address.focused, "⌘L goes to the address");
+    assert!(rt.state.browser.tab().address.focused, "⌘L goes to the address");
     rt.key(cmd('w'));
     rt.frame(1.0 / 60.0);
     assert!(!rt.state.inspector.is_open(), "⌘W in the browser closes it");
@@ -674,20 +675,89 @@ fn the_browser_takes_the_keyboard_from_the_terminal_and_survives_a_reload() {
     assert_eq!(rt.state.ws.live.len(), 1, "⌘W in the browser must not close the terminal");
     rt.key(shift_cmd_l);
     rt.frame(1.0 / 60.0);
-    assert!(rt.state.browser_open() && rt.state.browser.address.focused, "The next one starts empty, ready for an address");
+    assert!(rt.state.browser_open() && rt.state.browser.tab().address.focused, "The next one starts empty, ready for an address");
+}
+
+#[test]
+fn browser_tabs_open_switch_close_and_survive_a_reload() {
+    let repo = Repo::new();
+    let mut rt = runtime(&repo);
+    let tabs = |rt: &Runtime<App>| rt.state.browser_hand_off();
+    let shift_cmd = |c| KeyEvent { key: Key::Command(c), mods: rune::Mods { cmd: true, shift: true, ..Default::default() } };
+    rt.update(|s, tx| s.open_link("https://a.test/", tx));
+    rt.update(|s, tx| s.open_link("https://b.test/", tx));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(tabs(&rt), json!({ "tabs": ["https://a.test/", "https://b.test/"], "active": 1, "open": true }), "Each link gets a tab");
+    rt.update(|s, tx| s.open_link("https://a.test", tx));
+    assert_eq!(tabs(&rt)["active"], 0, "A link already open shows its tab rather than another");
+    assert_eq!(tabs(&rt)["tabs"], json!(["https://a.test/", "https://b.test/"]));
+
+    rt.key(cmd('l'));
+    rt.key(cmd('9'));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(tabs(&rt)["active"], 1, "⌘9 selects the last browser tab");
+    rt.key(cmd('l'));
+    rt.key(cmd('1'));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(tabs(&rt)["active"], 0, "⌘1 selects the first browser tab");
+    rt.update(|s, _| s.set_view(View::Settings));
+    rt.key(cmd('t'));
+    rt.frame(1.0 / 60.0);
+    rt.update(|s, _| s.set_view(View::Workspace));
+    assert_eq!(tabs(&rt), json!({ "tabs": ["https://a.test/", "https://b.test/"], "active": 0, "open": true }));
+
+    // The pane fades in, and takes no clicks until it's there.
+    for _ in 0..60 {
+        rt.frame(1.0 / 60.0);
+    }
+    click(&mut rt, "browser-new-tab");
+    assert_eq!(tabs(&rt), json!({ "tabs": ["https://a.test/", "https://b.test/", ""], "active": 2, "open": true }));
+    assert!(rt.state.browser.tab().address.focused, "A new tab is ready for an address");
+    rt.key(cmd('t'));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(tabs(&rt)["tabs"].as_array().map(Vec::len), Some(3), "An empty tab is new enough");
+
+    let mut next = runtime(&repo);
+    let handed = tabs(&rt);
+    next.update(|s, _| s.adopt_browser(&handed));
+    assert_eq!(tabs(&next), handed, "A reload keeps every tab");
+
+    rt.key(shift_cmd('['));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(tabs(&rt)["active"], 1, "⇧⌘[ goes to the tab before while the browser has the keyboard");
+    assert_eq!(rt.state.ws.live.len(), 1);
+    rt.key(cmd('t'));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(tabs(&rt), json!({ "tabs": ["https://a.test/", "https://b.test/", "", ""], "active": 3, "open": true }));
+    rt.key(cmd('w'));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(tabs(&rt), json!({ "tabs": ["https://a.test/", "https://b.test/", ""], "active": 2, "open": true }), "⌘W closes the tab");
+    rt.key(cmd('w'));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(tabs(&rt), json!({ "tabs": ["https://a.test/", "https://b.test/"], "active": 1, "open": true }));
+    click(&mut rt, "browser-tab-close-0");
+    assert_eq!(tabs(&rt), json!({ "tabs": ["https://b.test/"], "active": 0, "open": true }));
+    click(&mut rt, "browser-tab-close-0");
+    assert_eq!(tabs(&rt), json!({ "tabs": [""], "active": 0, "open": false }), "The last tab takes the pane with it");
+    rt.key(shift_cmd('t'));
+    rt.frame(1.0 / 60.0);
+    assert_eq!(tabs(&rt), json!({ "tabs": ["https://b.test/"], "active": 0, "open": true }), "⇧⌘T reopens the last tab even after the pane closed");
 }
 
 #[test]
 fn command_clicking_a_link_in_a_terminal_opens_it_where_settings_say() {
     let repo = Repo::new();
+    let url = "https://example.com/docs";
     let argv = ["/bin/sh", "-c", "printf 'see https://example.com/docs now'; sleep 60"].map(String::from).to_vec();
     let mut rt = runtime_command(&repo, argv);
-    let shows = |s: &App| s.current().and_then(|l| l.term.frame.as_ref()).is_some_and(|f| f.lines.iter().any(|l| l.runs.iter().any(|r| r.text.contains("example"))));
-    until(&mut rt, shows);
+    let link_cell = |s: &App| s.current()?.term.frame.as_ref()?.lines.iter().enumerate().find_map(|(row, line)| {
+        line.runs.iter().find_map(|run| run.text.find(url).map(|offset| (row, usize::from(run.col) + offset)))
+    });
+    until(&mut rt, |s| link_cell(s).is_some());
+    let (row, col) = link_cell(&rt.state).unwrap();
     let (cell_w, cell_h) = crate::term::cell(crate::term::style(&rt.state.settings.appearance.kit(true)));
     let ([x, y, _, _], _) = rt.presented("terminal").unwrap();
-    // Column 8 is inside the URL, which starts at column 4.
-    let (at_x, at_y) = (x + crate::term::INSET + cell_w * 8.5, y + crate::term::INSET + cell_h * 0.5);
+    let (at_x, at_y) = (x + crate::term::INSET + cell_w * (col as f32 + 0.5), y + crate::term::INSET + cell_h * (row as f32 + 0.5));
     let click = |rt: &mut Runtime<App>, cmd: bool| {
         rt.physical_input(rune::PhysicalInput::Modifiers(rune::Mods { cmd, ..Default::default() }));
         rt.pointer_down(at_x, at_y);
@@ -700,14 +770,14 @@ fn command_clicking_a_link_in_a_terminal_opens_it_where_settings_say() {
 
     rt.state.settings.links = crate::settings::Links::Browser;
     click(&mut rt, true);
-    assert_eq!(rt.take_url_requests(), ["https://example.com/docs"]);
+    assert_eq!(rt.take_url_requests(), [url]);
     assert!(!rt.state.inspector.is_open(), "The default browser has it, not the pane");
 
     rt.state.settings.links = crate::settings::Links::Hyper;
     click(&mut rt, true);
     assert!(rt.take_url_requests().is_empty());
     assert!(rt.state.inspector.is_open() && rt.state.project.mode == Mode::Browser);
-    assert_eq!(rt.state.browser.url(), "https://example.com/docs");
+    assert_eq!(rt.state.browser.url(), url);
 }
 
 #[test]
@@ -731,4 +801,44 @@ fn a_reload_keeps_the_keyboard_where_it_was_with_an_empty_browser_open() {
     rt.frame(1.0 / 60.0);
     assert!(rt.state.browser_open());
     assert!(!rt.state.browser_has_keyboard(), "The terminal keeps the keyboard across a reload");
+}
+
+#[test]
+fn browser_tabs_share_the_strip_and_scroll_to_the_one_shown() {
+    let repo = Repo::new();
+    let mut rt = runtime(&repo);
+    let open = |rt: &mut Runtime<App>, n: usize| {
+        rt.update(|s, tx| s.open_link(&format!("https://site{n}.test/"), tx));
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+    };
+    let rect = |rt: &Runtime<App>, key: &str| rt.presented(key).map(|(r, _)| r).unwrap_or_else(|| panic!("Missing {key}"));
+    let in_strip = |rt: &Runtime<App>, i: usize| {
+        let ([sx, _, sw, _], [x, _, w, _]) = (rect(rt, "browser-tabs"), rect(rt, &format!("browser-tab-{i}")));
+        x >= sx && x + w <= sx + sw
+    };
+    open(&mut rt, 0);
+    open(&mut rt, 1);
+    let strip = rect(&rt, "browser-tabs")[2];
+    assert_eq!([rect(&rt, "browser-tab-0")[2], rect(&rt, "browser-tab-1")[2]], [(strip - 2.0) / 2.0; 2], "Two tabs share the strip");
+
+    for n in 2..12 {
+        open(&mut rt, n);
+    }
+    assert!(in_strip(&rt, 11) && !in_strip(&rt, 0), "Past their narrowest the strip scrolls to the tab shown");
+
+    let handed = rt.state.browser_hand_off();
+    let mut restored = runtime(&repo);
+    restored.update(|s, _| s.adopt_browser(&handed));
+    for _ in 0..60 {
+        restored.frame(1.0 / 60.0);
+    }
+    assert!(in_strip(&restored, 11), "The restored tab is visible after the first layout");
+
+    rt.update(|s, tx| s.select_browser_tab(0, tx));
+    for _ in 0..60 {
+        rt.frame(1.0 / 60.0);
+    }
+    assert!(in_strip(&rt, 0), "Showing the first tab scrolls back to it");
 }
